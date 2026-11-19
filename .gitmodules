@@ -1,0 +1,3 @@
+[submodule "py-bsim"]
+	path = py-bsim
+	url = git@github.com:sslab-gatech/py-bsim.git

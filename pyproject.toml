@@ -1,0 +1,17 @@
+[project]
+name = "BinBomV2"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "tree-sitter>=0.21.3",
+    "tree-sitter-c>=0.21.4",
+    "tree-sitter-cpp>=0.22.3",
+    "py-tlsh==4.7.2",
+    "numpy>=1.24.0",
+    "gitdb==4.0.12",
+    "gitpython==3.1.45",
+    "smmap==5.0.2",
+    "faiss-cpu>=1.7.0",
+]
