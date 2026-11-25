@@ -28,7 +28,6 @@ def read_components_json(path: Optional[Path]) -> List[Dict[str, Any]]:
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     if isinstance(data, dict):
-        # Allow both dict with "components" key or plain list
         data = data.get("components", [])
     if not isinstance(data, list):
         raise ValueError("--components JSON must be a list or an object with 'components' list")
@@ -39,16 +38,13 @@ def safe_bom_ref(name: str, version: Optional[str]) -> str:
     base = f"lib:{name.strip()}"
     if version:
         base += f"@{version.strip()}"
-    # Replace problematic characters with '-'
     return re.sub(r"[^A-Za-z0-9._:@+\-]", "-", base)
 
 
 def guess_version_from_soname(soname: str) -> Optional[str]:
-    # e.g., "libssl.so.1.1" -> "1.1"
     m = re.search(r"\.so\.(\d[\w\.]*)$", soname)
     if m:
         return m.group(1)
-    # macOS: "libssl.1.1.dylib" -> "1.1"
     m = re.search(r"\.(\d[\w\.]*)\.dylib$", soname)
     if m:
         return m.group(1)
@@ -74,7 +70,6 @@ def normalize_component(entry: Dict[str, Any]) -> Dict[str, Any]:
     if "purl" in entry and entry["purl"]:
         comp["purl"] = entry["purl"]
 
-    # Licenses: accept ["MIT"] or [{"license":{"id":"MIT"}}] or {"expression": ...}
     licenses = entry.get("licenses")
     if isinstance(licenses, list):
         lic_objs = []
@@ -82,7 +77,6 @@ def normalize_component(entry: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(lic, str):
                 lic_objs.append({"license": {"id": lic}})
             elif isinstance(lic, dict):
-                # allow {"license":{"id":"MIT"}} or {"expression":"MIT OR Apache-2.0"}
                 if "license" in lic or "expression" in lic:
                     lic_objs.append(lic)
         if lic_objs:
@@ -116,7 +110,6 @@ def detect_binary_info(path: Path) -> Dict[str, str]:
     with open(path, "rb") as f:
         hdr = f.read(0x1000)
 
-    # ELF
     if hdr[:4] == b"\x7fELF":
         ei_class = hdr[4]  # 1 = 32-bit, 2 = 64-bit
         ei_data = hdr[5]   # 1 = little endian, 2 = big endian
@@ -143,14 +136,13 @@ def detect_binary_info(path: Path) -> Dict[str, str]:
         }
         info["arch"] = arch_map.get(e_machine, f"0x{e_machine:x}")
 
-        # OS from EI_OSABI
         osabi_map = {
             0x00: "linux",  # ELFOSABI_NONE/SYSV (commonly Linux)
             0x03: "linux",  # ELFOSABI_LINUX
             0x09: "freebsd",
             0x0C: "openbsd",
         }
-        info["os"] = osabi_map.get(ei_osabi, "linux")  # Default to linux for ELF
+        info["os"] = osabi_map.get(ei_osabi, "linux")
 
         return info
 
@@ -201,10 +193,6 @@ def run_ldd(binary: Path) -> List[Tuple[str, str]]:
     except (FileNotFoundError, subprocess.CalledProcessError):
         return []
     deps: List[Tuple[str, str]] = []
-    # Example lines:
-    #   libssl.so.1.1 => /lib/x86_64-linux-gnu/libssl.so.1.1 (0x00007f...)
-    #   libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f...)
-    #   linux-vdso.so.1 (0x00007fff...)
     for line in out.splitlines():
         line = line.strip()
         if "=>" in line:
@@ -213,7 +201,6 @@ def run_ldd(binary: Path) -> List[Tuple[str, str]]:
             path = right.split()[0] if right and right != "not found" else None
             deps.append((soname, path))
         else:
-            # e.g., "linux-vdso.so.1 (0x...)"
             m = re.match(r"^(\S+)\s+\(", line)
             if m:
                 soname = m.group(1)
@@ -238,7 +225,6 @@ def run_otool(binary: Path) -> List[Tuple[str, str]]:
         line = line.strip()
         if not line:
             continue
-        # Example: /usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1311.100.3)
         path = line.split(" (", 1)[0].strip()
         soname = os.path.basename(path)
         deps.append((soname, path))
@@ -269,7 +255,6 @@ def merge_components(*lists: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                                 existing.append(p)
                     elif k == "licenses":
                         existing_licenses = merged[key].setdefault("licenses", [])
-                        # naive de-dup
                         existing_licenses_json = {json.dumps(x, sort_keys=True) for x in existing_licenses}
                         for lic in v:
                             s = json.dumps(lic, sort_keys=True)
@@ -278,14 +263,14 @@ def merge_components(*lists: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return list(merged.values())
 
 
-# --------------------------- SBOM Builder --------------------------
 
 def build_bom(binary: Path,
               root_name: Optional[str],
               root_version: Optional[str],
               supplier: Optional[str],
               user_components_path: Optional[Path],
-              use_autodiscover: bool) -> Dict[str, Any]:
+              use_autodiscover: bool,
+              display_path: Optional[str] = None) -> Dict[str, Any]:
     if not binary.exists():
         raise FileNotFoundError(f"Binary not found: {binary}")
 
@@ -293,7 +278,6 @@ def build_bom(binary: Path,
     sha256 = sha256_file(binary)
     binary_info = detect_binary_info(binary)
 
-    # Print binary information
     print(f"    [*] Binary information:")
     print(f"        - File type: {binary_info['kind']}")
     print(f"        - Architecture: {binary_info['arch']}")
@@ -304,27 +288,25 @@ def build_bom(binary: Path,
     user_components = read_components_json(user_components_path)
     components = merge_components(user_components)
 
-    # Print component information
     print(f"    [*] Loaded {len(components)} component(s) from components file")
     for comp in components:
         comp_name = comp.get("name", "unknown")
         comp_ver = comp.get("version", "N/A")
         print(f"        - {comp_name} @ {comp_ver}")
 
-    # Get dynamic libraries from ldd (only include libs with actual file path, exclude vdso/ld-linux)
-    dynamic_libs = run_ldd(binary) if sys.platform.startswith("linux") else run_otool(binary) if sys.platform == "darwin" else []
+    dynamic_libs = []
+    if use_autodiscover:
+        dynamic_libs = run_ldd(binary) if sys.platform.startswith("linux") else run_otool(binary) if sys.platform == "darwin" else []
     dynamic_lib_refs = [safe_bom_ref(soname, None) for soname, fullpath in dynamic_libs if fullpath]
 
-    # Print dynamic library information
-    if use_autodiscover and dynamic_libs:
+    if dynamic_libs:
         actual_libs = [(soname, path) for soname, path in dynamic_libs if path]
         print(f"    [*] Discovered {len(actual_libs)} dynamic libraries (ldd):")
-        for soname, fullpath in actual_libs[:5]:  # Show first 5
+        for soname, fullpath in actual_libs[:5]:
             print(f"        - {soname}")
         if len(actual_libs) > 5:
             print(f"        - ... and {len(actual_libs) - 5} more")
 
-    # Metadata + subject component
     subject_bom_ref = f"app:{root_name}" + (f"@{root_version}" if root_version else "")
     metadata_component = {
         "bom-ref": subject_bom_ref,
@@ -340,7 +322,7 @@ def build_bom(binary: Path,
     metadata_component["properties"] = [
         {"name": "analysis:scope", "value": "binary-only:static"},
         {"name": "binary:file:type", "value": binary_info["kind"]},
-        {"name": "binary:file:path", "value": str(binary)},
+        {"name": "binary:file:path", "value": display_path or str(binary)},
         {"name": "build:target:arch", "value": binary_info["arch"]},
         {"name": "build:target:os", "value": binary_info["os"]},
         {"name": "binary:pie", "value": binary_info["pie"]},
@@ -374,22 +356,21 @@ def build_bom(binary: Path,
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    # Get script directory for output path
     script_dir = Path(__file__).resolve().parent
 
     p = argparse.ArgumentParser(description="Generate CycloneDX SBOM (JSON) for a binary.")
     p.add_argument("binary", help="Path to the binary")
     p.add_argument("components", help="Path to components JSON")
     p.add_argument("--ldd", action="store_true", help="Auto-discover shared libs.")
+    p.add_argument("--display-path", help="Path written to binary:file:path instead of the analyzed file's path.")
     args = p.parse_args(argv)
 
     binary_path = Path(args.binary).resolve()
     comps_path = Path(args.components).resolve() if args.components else None
 
-    # Auto-generate output path: output/{binary_name}-sbom.json
     output_dir = script_dir.parent / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
-    binary_name = binary_path.stem  # filename without extension
+    binary_name = binary_path.name
     output_path = output_dir / f"{binary_name}-sbom.json"
 
     bom = build_bom(
@@ -398,7 +379,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         root_version=None,
         supplier=None,
         user_components_path=comps_path,
-        use_autodiscover=args.ldd
+        use_autodiscover=args.ldd,
+        display_path=args.display_path,
     )
 
     out_json = json.dumps(bom, indent=2, ensure_ascii=False)

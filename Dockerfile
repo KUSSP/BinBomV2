@@ -1,6 +1,6 @@
 # BinBomV2 runtime environment.
 #   - With a binary:  analyzes it and writes a CycloneDX SBOM to /out
-#   - With a command: runs that command inside /app (e.g. the DB build steps)
+#   - With a command: runs that command inside /app
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \

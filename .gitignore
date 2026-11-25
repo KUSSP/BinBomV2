@@ -215,10 +215,13 @@ testset/**
 !testset/.gitkeep
 !testset/bin/
 !testset/bin/.gitkeep
-!testset/bin/bzip2_x64_O2
+!testset/bin/redis-server
+!testset/bin/redis-server.strip
 src/utils/config.json
 binaryDB/**
 !binaryDB/db_input/
 binaryDB/db_input/**
 !binaryDB/db_input/.gitkeep
+!binaryDB/db_input/night-shift__fpconv__libfpconv.so
+!binaryDB/db_input/night-shift__fpconv__libfpconv.so.meta.json
 output/

@@ -48,8 +48,6 @@ uv sync
 
 ## Usage
 
-The repository includes an example binary, `testset/bin/bzip2_x64_O2` (bzip2 1.0.8 built for x86-64 with `-O2`), and an `osscollector/repolist.txt` that lists bzip2, zlib and zstd. Running steps 1 to 5 as-is analyzes the example binary.
-
 ### 1. Collect OSS Sources
 
 List the repositories and versions to collect in `osscollector/repolist.txt`, one per line, in the format `<repository URL>, <library|application>, ["version tag", ...]`.
@@ -93,44 +91,29 @@ Match the preprocessed binaries against the component DB to detect their depende
 uv run python src/detector.py
 
 # Analyze a specific binary
-uv run python src/detector.py bzip2_x64_O2
+uv run python src/detector.py redis-server
 
 # Print detailed phase-by-phase progress
 uv run python src/detector.py -v
 ```
 
-The detection results are saved to `output/<binary>/<binary>.components.json`. For the example binary, the final report shows:
-
-```
-bzip2_x64_O2
-    [+] bzip2@@bzip2 (graph_size=26)
-```
+The detection results are saved to `output/<binary>/<binary>.components.json`.
 
 ### (Optional) Binary DB Detection
 
-**This step is optional.** If you skip it, the results from step 4 are used as-is for SBOM generation.
+Matches the target binaries against reference binaries to reduce false negatives of step 4.
 
-This step compares the target binaries with reference binaries built directly from open-source projects, using Ghidra BSim function similarity, and uses that evidence to improve the accuracy of the step 4 results. It requires the `py-bsim` submodule.
+Place each reference binary in `binaryDB/db_input/` together with a `<binary>.meta.json` that names its component (`owner@@repo`, as in the component DB).
 
-Place the reference binaries in `binaryDB/db_input/`, named in the `owner__repo__binary` format (for example, `bzip2__bzip2__bzip2`), and build the binary DB. You only need to rebuild it when the reference binaries change.
-
-```bash
-uv run python src/binaryDB_build.py
+```
+binaryDB/db_input/night-shift__fpconv__libfpconv.so
+binaryDB/db_input/night-shift__fpconv__libfpconv.so.meta.json   {"component": "night-shift@@fpconv", "version": "11ed624b20a3bda6284a428b35d4e8815e47e098"}
 ```
 
-> `tools/build_oss_binaries.sh` is a helper script that builds reference binaries from the sources collected in step 1 (`osscollector/repo_src`). By default it writes the binaries to `binaryDB/db_input/`; set the `OUTPUT_DIR` environment variable to change the output location, or `ONLY_REPOS` (for example, `ONLY_REPOS=bzip2@@bzip2`) to build only some repositories.
-
-After completing step 4, match the target binaries against the binary DB.
-
 ```bash
-# All binaries
-uv run python src/binaryDB_detect.py
-
-# Specific binaries
-uv run python src/binaryDB_detect.py bzip2_x64_O0 bzip2_x64_O2
+uv run python src/binaryDB_build.py     # build the binary DB
+uv run python src/binaryDB_detect.py    # run after step 4
 ```
-
-The results are saved to `output/<binary>/<binary>.binaryDB.components.json` in the same format as the original. The original results from step 4 (`<binary>.components.json`) are left unchanged.
 
 ### 5. Generate the SBOM
 
@@ -141,6 +124,11 @@ uv run python src/Binary_SBOM_Generation.py
 ```
 
 For binaries that have binary DB detection results (`<binary>.binaryDB.components.json`), the SBOM is generated from those results; otherwise, it is generated from the step 4 results. Each SBOM is saved to `output/<binary>-sbom.json`.
+
+| Option | Description |
+|---|---|
+| `--display-path <path>` | Write `<path>` to the SBOM's `binary:file:path` instead of the analyzed file's path. Requires exactly one binary in `testset/bin`. |
+| `--no-ldd` | Do not add the shared libraries `ldd` reports to `dependencies`. `ldd` lists the libraries of the machine running the analysis, not of the machine the binary came from. |
 
 ## Docker (Optional)
 
@@ -173,7 +161,7 @@ Put a single binary in a directory and mount it at `/input`. The container runs 
 
 ```bash
 mkdir -p input out
-cp testset/bin/bzip2_x64_O2 input/
+cp testset/bin/redis-server input/
 
 docker run --rm \
   -v "$PWD/database:/app/database:ro" \
@@ -184,7 +172,8 @@ docker run --rm \
 ```
 
 - `/app/database` and `/app/osscollector` are required. The detector reads release metadata from `osscollector/repo_meta/`.
-- If `/input` contains several files, pass the binary path as an argument, such as `binbomv2 /input/bzip2_x64_O2`.
+- If `/input` contains several files, pass the binary path as an argument, such as `binbomv2 /input/redis-server`.
+- The SBOM options `--display-path <path>` and `--no-ldd` (see step 5) go before the binary path: `binbomv2 --display-path uploads/redis-server --no-ldd`.
 - To include the optional binary DB detection, also mount `-v "$PWD/binaryDB:/app/binaryDB"`. When `binaryDB/db_index.pkl` exists, the container runs `binaryDB_detect.py` before generating the SBOM. Mount it writable, because BSim signatures of the target binaries are cached in `binaryDB/target_sig/`.
 - The container runs as root, so files it creates in mounted directories are owned by root.
 
@@ -206,7 +195,7 @@ docker run --rm \
 │   └── repolist.txt              # List of repositories to collect
 ├── database/                     # Component DB
 ├── testset/
-│   └── bin/                      # Target binaries (includes the bzip2_x64_O2 example)
+│   └── bin/                      # Target binaries
 ├── output/                       # Detection results and SBOMs
 ├── binaryDB/                     # (Optional) Binary DB
 │   └── db_input/                 # Reference binaries (owner__repo__binary)

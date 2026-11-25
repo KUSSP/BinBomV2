@@ -23,6 +23,7 @@ TARGET_BIN_DIR = currentPath + "/testset/bin"
 BINARY_FEATURES_TEMPLATE = currentPath + "/testset/{binary}/binary_features.json"
 PROVENANCE_DEP_GRAPH = currentPath + "/database/provenance/dependency_graph.json"
 REPO_META_DIR = currentPath + "/osscollector/repo_meta"
+COMPONENT_PROPERTY = "binbom:component"  # components.json property holding the owner@@repo id
 RARE_CONTROL_INDEX_PATH = currentPath + "/database/componentDB/rare_control_token_index.json"
 RARE_CONTROL_SHARD_DIR = currentPath + "/database/componentDB/rare_control_token_index"
 STARTUP_INDEX_PATH = currentPath + "/database/componentDB/startup_index.json"
@@ -46,6 +47,9 @@ PHASE15_PAIR_TOPK_PER_BIN_FUNC = 5
 PHASE16_SHARED_EVIDENCE_TOPK = 24
 MIN_SHARED_ONLY_GRAPH_SIZE = 8
 MIN_DEPENDENCY_CHILD_GRAPH_SIZE = 8
+# Few unique names survive inlining in small libraries; a unique name plus a
+# caller or callee from the library's own call graph is enough for them.
+SMALL_LIBRARY_MAX_FUNCS = 30
 DEBUG_STRING_PRINT_LIMIT = 10
 
 UNSUPPORTED_SYMBOLS = {"main", "usage", "_start", "__libc_start_main"}
@@ -144,7 +148,7 @@ class RareControlTokenIndex:
     source_index: Dict[str, List[Tuple[str, str]]]
 
 
-# General utilities (reused from new_detector2.py)
+# General utilities
 
 
 def is_stripped_binary(func_names: Set[str]) -> bool:
@@ -891,7 +895,7 @@ def load_dependency_children() -> Dict[str, Set[str]]:
 
 
 def load_hub_components() -> Set[str]:
-    """Components that vendor/share code with many others (benchmark harnesses like lzbench/TurboBench/precomp-cpp) rather than being a single distinct origin. Precomputed by preprocessor.py alongside startup_index.json."""
+    """Components that vendor code from many others. Precomputed by preprocessor.py."""
     return set(read_json(STARTUP_INDEX_PATH, {}).get("hub_components", []))
 
 
@@ -1676,6 +1680,10 @@ def build_committed_state(
 # Phase 2: symbol matching
 
 
+def is_small_library(idx: OssIndex) -> bool:
+    return len(idx.funcs) <= SMALL_LIBRARY_MAX_FUNCS
+
+
 def build_phase2_components(
     candidate_names: List[str],
     oss_indices: Dict[str, OssIndex],
@@ -1704,6 +1712,20 @@ def build_phase2_components(
 
         # Names are globally unique; don't exclude ones in another candidate's call_graph (forks).
         shared_symbols = shared_all
+        anchors = shared_all
+        if is_small_library(idx) and shared_all:
+            # Callers and callees of a unique name that the library also
+            # defines, even under a name other components define too. Every
+            # edge kept below touches a unique name.
+            shared_symbols = shared_all | {
+                sym
+                for anchor in shared_all
+                for sym in list(bin_callgraph.get(anchor, [])) + list(bin_reverse_cg.get(anchor, []))
+                if sym in idx.funcs
+                and sym in all_bin_nodes
+                and sym not in UNSUPPORTED_SYMBOLS
+                and not is_generated_function_name(sym)
+            }
         if len(shared_symbols) < PHASE2_MIN_SIZE:
             continue
 
@@ -1711,6 +1733,8 @@ def build_phase2_components(
         for caller in shared_symbols:
             for callee in bin_callgraph.get(caller, []):
                 if callee not in shared_symbols:
+                    continue
+                if caller not in anchors and callee not in anchors:
                     continue
                 rel = relation_class(
                     caller, callee, caller, callee,
@@ -1920,7 +1944,6 @@ def choose_neighbor(
     bin_callstr = bin_callstr_tokens.get(bin_neighbor, set())
     local_disc_strs = set(idx.funcs_by_local_str.keys())
 
-    # Prioritize string-supported candidates for iteration order
     string_supported: Set[str] = set()
     for s in bin_strings:
         string_supported.update(idx.funcs_by_string.get(s, set()) & candidate_plains)
@@ -2597,6 +2620,56 @@ def suppress_by_match_quality(
         out.append(item)
     return out
 
+SHARED_EVIDENCE_PHASES = {
+    "phase3_unified_direct", "phase35_controlblock_callstr",
+    "phase2_shared_symbol", "phase2_shared_symbol_set",
+}
+
+
+def suppress_explained_matches(
+    detected_oss: List[dict],
+    bin_string_refs: Dict[str, Set[str]],
+    string_owner_index: Dict[str, Set[str]],
+    funcname_owner_index: Dict[str, Set[str]],
+) -> List[dict]:
+    names = {item["name"] for item in detected_oss}
+
+    def evidence(item: dict) -> Dict[str, Set[str]]:
+        # token -> the detected components it belongs to
+        name = item["name"]
+        out: Dict[str, Set[str]] = {}
+        for bin_func, oss_func in item.get("matched_pairs", {}).items():
+            for s in bin_string_refs.get(bin_func, ()):
+                owners = string_owner_index.get(s, set())
+                if name in owners:
+                    out[f"string:{s}"] = set(owners) & names
+            owners = funcname_owner_index.get(oss_func, set())
+            if bin_func == oss_func and name in owners:
+                out[f"symbol:{oss_func}"] = set(owners) & names
+        return out
+
+    tokens = {item["name"]: evidence(item) for item in detected_oss}
+    independent = {
+        item["name"] for item in detected_oss
+        if not set(item.get("phases", [])) <= SHARED_EVIDENCE_PHASES
+        or any(owners <= {item["name"]} for owners in tokens[item["name"]].values())
+    }
+    out = []
+    for item in detected_oss:
+        name = item["name"]
+        explainers = independent - {name}
+        if name not in independent and tokens[name] and all(
+            owners & explainers for owners in tokens[name].values()
+        ):
+            covering = sorted({o for owners in tokens[name].values() for o in owners & explainers})
+            log(
+                f"    [-] Suppressing {name}: all {len(tokens[name])} matched strings/names "
+                f"also belong to {', '.join(covering)}"
+            )
+            continue
+        out.append(item)
+    return out
+
 
 def suppress_subcomponent_spillover(
     detected_oss: List[dict],
@@ -2622,15 +2695,14 @@ def suppress_subcomponent_spillover(
             out.append(item)
             continue
 
-        # Build plain_name → list of (function_id, observed_in_set)
         funcs_by_plain: DefaultDict[str, List[Tuple[str, Set[str]]]] = defaultdict(list)
         for fid, meta in bucket.items():
             fname = meta.get("function_name", "")
             if fname:
                 funcs_by_plain[fname].append((fid, set(meta.get("observed_in", []))))
 
-        own_unique_to_parent: Set[str] = set()  # plain_names not present in any child
-        shared_with_children: Set[str] = set()  # plain_names present in ≥1 child
+        own_unique_to_parent: Set[str] = set()
+        shared_with_children: Set[str] = set()
         contributing_children: Set[str] = set()
 
         for _bin_func, plain_name in item.get("matched_pairs", {}).items():
@@ -2653,11 +2725,9 @@ def suppress_subcomponent_spillover(
             out.append(item)
             continue
         if own_unique_to_parent:
-            # Parent has a matched func absent from every child → genuine; keep.
             out.append(item)
             continue
 
-        # 100% of matched functions also exist inside a known sub-component.
         children_detected = contributing_children & detected_names
         if children_detected:
             log(
@@ -2666,9 +2736,7 @@ def suppress_subcomponent_spillover(
             )
             continue
 
-        # Sub-components not independently detected → ambiguous.
         if hub_components and name in hub_components:
-            # Hub fully explained by a known sub-component → drop.
             log(
                 f"    [-] Suppressing {name}: 100% subcomponent overlap with "
                 f"{sorted(contributing_children)} and {name} is a known vendoring hub"
@@ -2763,6 +2831,7 @@ def expand_dependency_children(
             if (
                 child_result.get("graph_size", 0) < MIN_DEPENDENCY_CHILD_GRAPH_SIZE
                 and not (child_phases & {"phase35_controlblock_callstr", "phase3_unified_direct"})
+                and not ("phase2_symbol" in child_phases and is_small_library(idx))
             ):
                 continue
             child_result["decision"] = "dependency_supported_component"
@@ -2829,7 +2898,7 @@ def suppress_isolated_matches(
     return kept
 
 
-# Per-binary component list output (consumed later by Binary_SBOM_Generation.py)
+# Per-binary component list output
 
 
 def load_component_release_meta(oss_name: str) -> Optional[Dict[str, str]]:
@@ -2853,22 +2922,32 @@ def load_component_release_meta(oss_name: str) -> Optional[Dict[str, str]]:
     return {"version": version, "purl": purl, "license": license_id, "type": component_type}
 
 
+def component_entry(oss_name: str) -> Optional[Dict[str, Any]]:
+    """One components.json entry for oss_name, or None without release metadata."""
+    meta = load_component_release_meta(oss_name)
+    if not meta:
+        return None
+    return {
+        "name": oss_name.split("@@")[-1],
+        "version": meta["version"],
+        "type": meta["type"],
+        "purl": meta["purl"],
+        "licenses": [{"license": {"id": meta["license"]}}],
+        # full component id; binaryDB_detect.py matches binary DB components with it
+        "properties": [{"name": COMPONENT_PROPERTY, "value": oss_name}],
+    }
+
+
 def write_binary_components_json(binary_name: str, detected_oss: List[dict]) -> str:
     """Write output/{binary}/{binary}.components.json, the input Binary_SBOM_Generation.py expects when generating the CycloneDX SBOM for this binary."""
     components = []
     for oss_info in detected_oss:
         oss_name = oss_info["name"]
-        meta = load_component_release_meta(oss_name)
-        if not meta:
+        entry = component_entry(oss_name)
+        if not entry:
             print(f"    [!] No release metadata for {oss_name}; skipping in components.json")
             continue
-        components.append({
-            "name": oss_name.split("@@")[-1],
-            "version": meta["version"],
-            "type": meta["type"],
-            "purl": meta["purl"],
-            "licenses": [{"license": {"id": meta["license"]}}],
-        })
+        components.append(entry)
     output_bin_dir = os.path.join(OUTPUT_DIR, binary_name)
     os.makedirs(output_bin_dir, exist_ok=True)
     components_path = os.path.join(output_bin_dir, f"{binary_name}.components.json")
@@ -2885,15 +2964,10 @@ def write_binary_components_json(binary_name: str, detected_oss: List[dict]) -> 
 
 
 def discard_binary_db_components(binary_name: str) -> None:
-    # the O0/O2 sibling result was made from this one too
-    names = [binary_name]
-    if binary_name.endswith(("O0", "O2")):
-        names.append(binary_name[:-2] + ("O2" if binary_name.endswith("O0") else "O0"))
-    for name in names:
-        path = os.path.join(OUTPUT_DIR, name, f"{name}.binaryDB.components.json")
-        if os.path.exists(path):
-            os.remove(path)
-            print(f"    [*] Source components changed; removed stale {path}")
+    path = os.path.join(OUTPUT_DIR, binary_name, f"{binary_name}.binaryDB.components.json")
+    if os.path.exists(path):
+        os.remove(path)
+        print(f"    [*] Source components changed; removed stale {path}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -3199,6 +3273,9 @@ def main() -> None:
             bin_control_tokens,
             bin_callstr_tokens,
             bin_string_profiles,
+        )
+        detected_oss = suppress_explained_matches(
+            detected_oss, bin_string_refs, string_owner_index, funcname_owner_index,
         )
         detected_oss = attach_dependency_children(detected_oss, dependency_children)
 

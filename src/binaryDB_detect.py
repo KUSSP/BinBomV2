@@ -2,8 +2,8 @@ import argparse, collections, json, multiprocessing, os, sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import binaryDB_build
-from binaryDB_build import ROOT, WEIGHTS, SIMILARITY_MIN, CONFIDENCE_MIN, signature, vectors, py_bsim
+import binaryDB_build, detector
+from binaryDB_build import ROOT, WEIGHTS, SIMILARITY_MIN, CONFIDENCE_MIN, signature, vectors, calls, py_bsim
 
 TARGETS = ROOT / 'testset/bin'
 SOURCE_RESULTS = ROOT / 'output'
@@ -11,7 +11,7 @@ TARGET_SIG = ROOT / 'binaryDB/target_sig'
 WORKERS_MAX = 8
 
 CANDIDATES_MAX = 80  # components compared per function
-CONFIRM_MIN = 2      # matched functions needed to confirm a component
+COMPONENT_PROPERTY = detector.COMPONENT_PROPERTY
 
 def match(functions, records, index, weights):
     byref={}
@@ -35,7 +35,8 @@ def match(functions, records, index, weights):
     return votes
 
 def compute_votes(target):
-    return target.name,match(vectors(signature(target,TARGET_SIG),_weights),_records,_index,_weights)
+    sig=signature(target,TARGET_SIG)
+    return target.name,(match(vectors(sig,_weights),_records,_index,_weights),calls(sig))
 
 def all_votes(targets, records, index):
     global _records,_index,_weights
@@ -50,40 +51,39 @@ def load_source(name):
     path=SOURCE_RESULTS/name/(name+'.components.json')
     if not path.is_file():return None
     grouped=collections.defaultdict(list)
-    for entry in json.loads(path.read_text()):grouped[entry['name'].lower()].append(entry)
+    for entry in json.loads(path.read_text()):
+        ids=[x['value'] for x in entry.get('properties',[]) if x.get('name')==COMPONENT_PROPERTY]
+        if not ids:raise ValueError(f'{path}: component {entry.get("name")!r} has no {COMPONENT_PROPERTY}; rerun src/detector.py')
+        grouped[ids[0]].append(entry)
     return grouped
 
 def result_path(name):
     return SOURCE_RESULTS/name/(name+'.binaryDB.components.json')
 
-def sibling_of(name):
-    if name.endswith('O0'):return name[:-2]+'O2'
-    if name.endswith('O2'):return name[:-2]+'O0'
-    return None
+def preserved_calls(matched, reference_calls, target_calls):
+    """Reference calls between two matched functions that the target makes too."""
+    pairs=[(t,r) for t,(_,_,r) in matched.items()]
+    return sum(1 for t1,r1 in pairs for t2,r2 in pairs if (r1,r2) in reference_calls and (t1,t2) in target_calls)
 
-def tagged(entry, value):
-    entry=dict(entry)
-    entry['properties']=list(entry.get('properties',[]))+[{'name':'binaryDBModule:evidence','value':value}]
-    return entry
-
-def resolve(mine, other, votes, tails):
-    def support(name):
-        return max((len(votes.get(c,())) for c in tails.get(name,())),default=0)
-    components=[];decisions={}
-    for name,entries in mine.items():
-        if other is None or name in other:
-            components.extend(entries);continue
-        count=support(name)
-        if name not in tails:decision='kept: disputed, not in binary DB'
-        elif count>=CONFIRM_MIN:decision=f'kept: disputed, {count} reference functions matched'
-        else:decision=f'removed: disputed, {count} reference functions matched'
-        decisions[name]=decision
-        if not decision.startswith('removed'):components.extend(entries)
-    for name,entries in (other or {}).items():
-        count=support(name)
-        if name in mine or count<CONFIRM_MIN:continue
-        decisions[name]=f'added from sibling: {count} reference functions matched'
-        components.extend(tagged(x,'sibling source result confirmed by BSim') for x in entries)
+def resolve(mine, votes, references, reference_calls, target_calls):
+    """Never removes a source result: no match may only mean no matching reference.
+    Adds a missed component only when two matched functions call each other in
+    both the reference and the target."""
+    components=[entry for entries in mine.values() for entry in entries];decisions={}
+    for c in mine:
+        count=len(votes.get(c,()))
+        decisions[c]='kept: not in binary DB' if c not in references else f'kept: {count} of {references[c]} reference functions matched'
+    for c,matched in sorted(votes.items()):
+        if c in mine:continue
+        found=f'{len(matched)} of {references[c]} reference functions matched'
+        preserved=preserved_calls(matched,reference_calls.get(c,set()),target_calls)
+        if not preserved:decisions[c]=f'not added: {found}, but no call between them is in the target';continue
+        entry=detector.component_entry(c)
+        if entry is None:decisions[c]=f'not added: {found}, {preserved} calls preserved, but no release metadata';continue
+        evidence=f'BSim: {found}, {preserved} reference calls between them preserved'
+        entry['properties'].append({'name':'binaryDBModule:evidence','value':evidence})
+        decisions[c]=f'added: {found}, {preserved} calls preserved'
+        components.append(entry)
     return components,decisions
 
 def main(argv=None):
@@ -98,22 +98,20 @@ def main(argv=None):
     else:
         targets=sorted(x for x in TARGETS.iterdir() if x.is_file())
     if not targets: p.error(f'no target binaries in {TARGETS}')
-    sources={t.name:load_source(t.name) for t in targets}
+    try:sources={t.name:load_source(t.name) for t in targets}
+    except ValueError as e:p.error(str(e))
     for name in [name for name,source in sources.items() if source is None]:
         print(f'{name}: no source SCA result, skipped',file=sys.stderr)
     targets=[t for t in targets if sources[t.name] is not None]
     if not binaryDB_build.DATABASE.is_file(): p.error('reference database not found; run src/binaryDB_build.py first')
-    records,index,stale=binaryDB_build.load()
-    if stale: p.error('binaryDB/db_input/ or CONFIDENCE_MIN changed since the reference database was built; rerun src/binaryDB_build.py')
+    records,index,reference_calls,stale=binaryDB_build.load()
+    if stale: p.error('the reference database is out of date (binaryDB/db_input/, CONFIDENCE_MIN or its format changed); rerun src/binaryDB_build.py')
     found=all_votes(targets,records,index)
-    tails=collections.defaultdict(list)
-    for c in sorted({r[0] for r in records}):tails[c.split('@@')[-1]].append(c)
+    references=collections.Counter(r[0] for r in records)
     for target in targets:
         name=target.name
-        votes=found[name]
-        sibling=sibling_of(name)
-        other=load_source(sibling) if sibling else None
-        components,decisions=resolve(sources[name],other,votes,tails)
+        votes,target_calls=found[name]
+        components,decisions=resolve(sources[name],votes,references,reference_calls,target_calls)
         print(f'{name}: {len(components)} components',flush=True)
         for subject,decision in decisions.items():print(f'    {subject}: {decision}',flush=True)
         result_path(name).write_text(json.dumps(components,indent=4))

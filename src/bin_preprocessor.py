@@ -11,7 +11,6 @@ import re
 from pathlib import Path
 
 
-# Add src directory to Python path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.function_preprocessing import CBMaker
@@ -188,7 +187,6 @@ def build_headless_command(ghidra_install_dir, project_dir, project_name, binary
     if not os.path.exists(analyze_headless):
         raise FileNotFoundError("analyzeHeadless not found under {}".format(ghidra_install_dir))
 
-    # Ensure paths are absolute
     project_dir = os.path.abspath(project_dir)
     binary_path = os.path.abspath(binary_path)
     script_path = os.path.abspath(script_path)
@@ -208,7 +206,6 @@ def build_headless_command(ghidra_install_dir, project_dir, project_name, binary
 def clean_ghidra_project():
 
 
-    # Delete .rep folder, .gpr and .lock files
     project_rep = os.path.join(PROJECT_DIR, "{}.rep".format(PROJECT_NAME))
     project_gpr = os.path.join(PROJECT_DIR, "{}.gpr".format(PROJECT_NAME))
     project_lock = os.path.join(PROJECT_DIR, "{}.lock".format(PROJECT_NAME))
@@ -230,7 +227,6 @@ class TimeoutException(Exception):
 
 
 def timeout_handler(signum, frame):
-    """Timeout signal handler"""
     raise TimeoutException("Processing timeout")
 
 
@@ -242,11 +238,9 @@ def process_func_file_to_controlblock(func_file_path, output_json_path, timeout_
     thunk_name_map = load_thunk_name_map(binary_name)
 
     try:
-        # Setup timeout (Linux/Unix only)
         old_handler = signal.signal(signal.SIGALRM, timeout_handler)
         signal.alarm(timeout_seconds)
 
-        # Analyze with CBMaker (C language)
         try:
             analyzer = CBMaker(language='c')
         except Exception as e:
@@ -255,7 +249,6 @@ def process_func_file_to_controlblock(func_file_path, output_json_path, timeout_
                 signal.signal(signal.SIGALRM, old_handler)
             return (False, "CBMaker initialization failed: {}".format(str(e)))
 
-        # Suppress output (both stdout and stderr)
         sys.stdout = io.StringIO()
         sys.stderr = io.StringIO()
 
@@ -286,14 +279,12 @@ def process_func_file_to_controlblock(func_file_path, output_json_path, timeout_
                 signal.signal(signal.SIGALRM, old_handler)
             return (False, "Analysis exception: {}".format(error_output), [])
 
-        # Cancel timeout on successful completion
         signal.alarm(0)
         sys.stdout = old_stdout
         sys.stderr = old_stderr
         if old_handler:
             signal.signal(signal.SIGALRM, old_handler)
 
-        # Check if JSON file is created and contains data
         if not Path(output_json_path).exists():
             return (False, "Output JSON file not created", callees)
 
@@ -327,32 +318,18 @@ def process_func_file_to_controlblock(func_file_path, output_json_path, timeout_
 
 
 def generate_control_blocks_for_binary(binary_name):
-    """
-    Convert decompiled functions to control blocks
-
-    Args:
-        binary_name: Binary file name
-
-    Returns:
-        (success_count, total_count) tuple
-    """
-    # Decompiled functions path
+    """Convert decompiled functions to control blocks. Returns (success_count, total_count)."""
     decompile_dir = Path(TargetOutputPath) / binary_name / "decompliecode" / binary_name
-    # Control block output path
     funcblock_dir = Path(TargetOutputPath) / binary_name / "func_blocks"
-    # Callgraph output path
     callgraph_path = Path(TargetOutputPath) / binary_name / "callgraph.json"
-    # Function Name Index path
     idx_file_path = Path(TargetOutputPath) / binary_name / "func_names.json"
 
     if not decompile_dir.exists():
         print("  [!] Decompiled functions directory not found: {}".format(decompile_dir))
         return 0, 0
 
-    # Create output directory
     funcblock_dir.mkdir(parents=True, exist_ok=True)
 
-    # Find all .c files
     func_files = list(decompile_dir.glob("*.c"))
 
     if not func_files:
@@ -362,7 +339,6 @@ def generate_control_blocks_for_binary(binary_name):
     total_count = len(func_files)
     print("  [+] Converting {} functions to control blocks...".format(total_count))
 
-    # Error log file
     error_log_path = funcblock_dir / "processing_errors.log"
     error_log_file = open(error_log_path, 'w', encoding='utf-8')
     error_log_file.write("Control Block Processing Errors for {}\n".format(binary_name))
@@ -378,10 +354,9 @@ def generate_control_blocks_for_binary(binary_name):
         real_func_names = normalize_function_name_mapping(json.load(f), thunk_name_map)
     try:
         for i, func_file in enumerate(func_files, 1):
-            func_name = func_file.stem  # Filename without extension
+            func_name = func_file.stem
             output_json = funcblock_dir / "{}.json".format(func_name)
 
-            # Skip already processed files
             if output_json.exists():
                 try:
                     with open(output_json, "r", encoding="utf-8") as f:
@@ -401,7 +376,6 @@ def generate_control_blocks_for_binary(binary_name):
                     callgraph[normalize_binary_function_name(func_name, thunk_name_map)] = []
                 success_count += 1
                 continue
-            # Generate control block
             success, error_msg, callees = process_func_file_to_controlblock(
                 str(func_file),
                 str(output_json),
@@ -414,7 +388,6 @@ def generate_control_blocks_for_binary(binary_name):
             else:
                 failed_count += 1
 
-                # Extract error type
                 if "Timeout" in error_msg:
                     error_type = "Timeout"
                 elif "Analysis exception" in error_msg:
@@ -428,17 +401,14 @@ def generate_control_blocks_for_binary(binary_name):
 
                 error_types[error_type] = error_types.get(error_type, 0) + 1
 
-                # Detailed error log
                 error_log_file.write("[{}] {}\n  Reason: {}\n\n".format(
                     failed_count, func_file.name, error_msg))
                 error_log_file.flush()
 
-            # Show progress (every 100 items)
             if i % 100 == 0 or i == total_count:
                 print("    Progress: {}/{} ({} successful, {} failed)".format(
                     i, total_count, success_count, failed_count))
 
-        # Error statistics
         error_log_file.write("\n" + "="*80 + "\n")
         error_log_file.write("Error Statistics:\n")
         error_log_file.write("="*80 + "\n")
@@ -464,9 +434,8 @@ def extract_filtered_strings_from_blocks(blocks):
     for block in blocks:
         if not isinstance(block, dict):
             continue
-        if block.get("block_type", "") != "String":
-            continue
-        for value in block.get("key_feature_dvector", {}).get("literal_values", []):
+        # Every literal the function uses, including those inside conditions.
+        for value in (block.get("key_feature_dvector") or {}).get("literal_values", []):
             if isinstance(value, str) and is_discriminative_string(value):
                 strings.add(value)
     return sorted(strings)
@@ -560,7 +529,6 @@ def process_binary(binary_path, binary_name):
         print("\n[Step 1/2] Reusing existing decompiled code...")
         print("  [+] Found {} decompiled functions at {}".format(func_count, decompile_dir))
     else:
-        # Step 1: Ghidra decompilation
         print("\n[Step 1/2] Decompiling with Ghidra...")
         clean_ghidra_project()
         create_config_json(binary_name)

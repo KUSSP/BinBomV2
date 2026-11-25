@@ -21,15 +21,14 @@ import preprocess_clang as preClang
 currentPath = os.getcwd() + "/osscollector"
 gitCloneURLS = currentPath + "/repolist.txt"
 funcCodePath = currentPath + "/repo_funcCode/"
-clonePath = currentPath + "/repo_src/"  # Default path
-tagDatePath = currentPath + "/repo_date/"  # Default path
-resultPath = currentPath + "/repo_functions/"  # Default path
+clonePath = currentPath + "/repo_src/"
+tagDatePath = currentPath + "/repo_date/"
+resultPath = currentPath + "/repo_functions/"
 metaPath = currentPath + "/repo_meta/"  # Path for SBOM metadata (license, purl)
 funcMetaPath = currentPath + "/repo_funcMeta/"
 repoSidecarPath = currentPath + "/repo_repoMeta/"
 ctagsPath = shutil.which("ctags") or "/bin/ctags"  # Prefer PATH discovery; fallback for legacy setups
 
-# License file patterns
 LICENSE_PATTERNS = ["LICENSE", "LICENSE.txt", "LICENSE.md", "LICENCE", "COPYING", "COPYING.*"]
 MANIFEST_PATTERNS = [
     "CMakeLists.txt",
@@ -87,14 +86,12 @@ BLACKLIST_TOKENS = {
     "extra",
 }
 
-# Generate directories
 shouldMake = [clonePath, tagDatePath, resultPath, metaPath, funcMetaPath, repoSidecarPath]
 for eachRepo in shouldMake:
     if not os.path.isdir(eachRepo):
         os.mkdir(eachRepo)
 
 
-# Generate TLSH
 def computeTlsh(string):
     string = str.encode(string)
     hs = tlsh.forcehash(string)
@@ -337,24 +334,19 @@ def detect_license_id(repo_dir):
                     with open(match, 'r', encoding='utf-8', errors='ignore') as f:
                         content = f.read().lower()
 
-                    # 0) SPDX-License-Identifier가 있으면 최우선 (가장 정확)
-                    #    예: "spdx-license-identifier: mit"
+                    # SPDX-License-Identifier가 있으면 우선
                     m = re.search(r"spdx-license-identifier:\s*([a-z0-9\.\-+ ]+)", content)
                     if m:
                         spdx = m.group(1).strip()
-                        # 흔한 끝문자 제거
                         spdx = re.sub(r"[;)\].,]+$", "", spdx)
-                        # 공백 제거 + 대문자 정규화(단, -or-later 같은건 대문자여도 문제없음)
                         return spdx.replace(" ", "").upper()
 
-                    # 1) SSPL / RSALv2는 GPL/AGPL보다 먼저 (문구가 겹쳐 오탐 방지)
+                    # SSPL / RSALv2는 GPL/AGPL과 문구가 겹치므로 먼저 확인
                     if "server side public license" in content or ("sspl" in content and "license" in content):
                         return "SSPL-1.0"
                     elif "redis source available license" in content or "rsalv2" in content or "redis source available license 2.0" in content:
-                        # SPDX 표준 ID로 단정하기 애매 → LicenseRef로
                         return "LicenseRef-RSALv2"
 
-                    # 2) MIT (강한 시그니처)
                     if ("permission is hereby granted, free of charge, to any person obtaining a copy" in content
                         and ("the software is provided \"as is\"" in content or "the software is provided 'as is'" in content)
                         and "without warranty of any kind" in content):
@@ -362,21 +354,17 @@ def detect_license_id(repo_dir):
                     elif "mit license" in content and "permission is hereby granted" in content:
                         return "MIT"
 
-                    # 3) Apache-2.0 (정형 문구/URL)
                     elif ("apache license" in content and "version 2.0" in content
                           and ("http://www.apache.org/licenses/license-2.0" in content
                                or "you may not use this file except in compliance with the license" in content)):
                         return "Apache-2.0"
 
-                    # 4) MPL-2.0
                     elif "mozilla public license" in content and ("version 2.0" in content or "mpl 2.0" in content):
                         return "MPL-2.0"
 
-                    # 5) Boost
                     elif "boost software license" in content and ("version 1.0" in content or "boost software license - version 1.0" in content):
                         return "BSL-1.0"
 
-                    # 6) ISC (짧지만 강한 시그니처)
                     elif ("permission to use, copy, modify, and/or distribute this software for any purpose" in content
                           and "provided that the above copyright notice" in content
                           and ("the software is provided \"as is\"" in content or "the software is provided 'as is'" in content)):
@@ -384,12 +372,11 @@ def detect_license_id(repo_dir):
                     elif "isc license" in content:
                         return "ISC"
 
-                    # 7) BSD 2/3-clause (endorsement 문구로 구분)
+                    # BSD 2/3-clause는 endorsement 문구로 구분
                     elif "redistribution and use in source and binary forms" in content:
                         if "neither the name of" in content and "nor the names of its contributors" in content:
                             return "BSD-3-Clause"
                         # 2-clause는 보통 endorsement 문구가 없다.
-                        # 애매하면 단정하지 말고 UNKNOWN
                         elif "this list of conditions and the following disclaimer" in content:
                             return "BSD-2-Clause"
                         else:
@@ -399,7 +386,6 @@ def detect_license_id(repo_dir):
                     elif "bsd 2-clause" in content:
                         return "BSD-2-Clause"
 
-                    # 8) AGPL / LGPL / GPL (버전 + only/or-later)
                     elif "gnu affero general public license" in content:
                         if "version 3" in content:
                             if "or (at your option) any later version" in content or "or later" in content:
@@ -439,7 +425,6 @@ def detect_license_id(repo_dir):
 
 def collect_and_save_metadata(repo_dir, repo_name, version, component_type):
     name = repo_name.split("@@")[-1] if "@@" in repo_name else repo_name
-    # Remove "v" or "v." prefix from version
     clean_version = version
     if version and version != "default":
         if version.lower().startswith("v."):
@@ -447,7 +432,6 @@ def collect_and_save_metadata(repo_dir, repo_name, version, component_type):
         elif version.lower().startswith("v"):
             clean_version = version[1:]
 
-    # Generate PURL (pkg:generic/name@version)
     purl = f"pkg:generic/{name}@{clean_version}" if clean_version and clean_version != "default" else f"pkg:generic/{name}"
 
     license_id = detect_license_id(repo_dir)
@@ -466,7 +450,6 @@ def extract_functions(filePath):
         _, file_extension = os.path.splitext(filePath)
         file_extension = file_extension.lower()
         ctags_command = f'{ctagsPath} -f - --kinds-C=* --fields=neKSt "{filePath}"'
-        # for .i extension
         if file_extension == '.i':
             base_file_name = os.path.splitext(filePath)[0]
             _, new_file_extension = os.path.splitext(base_file_name)
@@ -475,6 +458,8 @@ def extract_functions(filePath):
                 '.c': 'C',
                 '.cc': 'C++',
                 '.cpp': 'C++',
+                '.cxx': 'C++',
+                '.c++': 'C++',
             }
             language_option = language_map.get(new_file_extension, None)
             # Apply language force only when detectable
@@ -567,7 +552,7 @@ def get_file_birth_date(repoPath, storedPath, cache):
     return cache[storedPath]
 
 def hashing(repoPath, saveCodePath, repoName="", versionName="", submodules=None):
-    possible = (".c", ".cc", ".cpp")
+    possible = (".c", ".cc", ".cpp", ".cxx", ".c++")
     fileCnt = 0
     funcCnt = 0
     lineCnt = 0
@@ -575,10 +560,8 @@ def hashing(repoPath, saveCodePath, repoName="", versionName="", submodules=None
     funcMeta = {}
     path_birth_cache = {}
 
-    # Clean up old .i files before preprocessing
     cleanup_preprocessed_files(repoPath)
 
-    # Clang Preprocessing
     preClang.process_files_in_directory(repoPath)
 
     for path, _, files in filtered_walk(repoPath):
@@ -650,7 +633,7 @@ def hashing(repoPath, saveCodePath, repoName="", versionName="", submodules=None
                         occurrence["submodule_component"] = submodule.get("component", "")
                     funcMeta[funcHash]["occurrences"].append(occurrence)
 
-                    file_ext = os.path.splitext(filePath)[1]  # .c, .cpp, .cc 등 원본 확장자
+                    file_ext = os.path.splitext(filePath)[1]
                     hash_file_path = os.path.join(saveCodePath, f'{funcHash}{file_ext}')
                     if not os.path.exists(hash_file_path):
                         if not os.path.exists(saveCodePath):
@@ -664,7 +647,6 @@ def hashing(repoPath, saveCodePath, repoName="", versionName="", submodules=None
     return resDict, funcMeta, fileCnt, funcCnt, lineCnt
 
 def indexing(resDict, title, filePath):
-    # For indexing each OSS
     with open(filePath, 'w') as fres:
         fres.write(title + '\n')
 
@@ -690,27 +672,23 @@ def is_repo_completed(repoName):
 def is_valid_version_tag(tag_name: str) -> bool:
     tag_str = str(tag_name)
     
-    # beta, alpha, pre, rc, dev, snapshot 등 프리릴리즈 버전 제외
     prerelease_patterns = ['alpha', 'beta', 'pre', 'rc', 'dev', 'snapshot', 'nightly', 'canary', 'test']
     tag_lower = tag_str.lower()
     for pattern in prerelease_patterns:
         if pattern in tag_lower:
             return False
     
-    # v 또는 v. 접두사 제거 (파싱용)
     cleaned = tag_str
     if cleaned.lower().startswith('v.'):
         cleaned = cleaned[2:]
     elif cleaned.lower().startswith('v'):
         cleaned = cleaned[1:]
     
-    # 패턴 2
     project_version_pattern = re.compile(r'^[a-zA-Z][a-zA-Z0-9]*[._-](.+)$')
     match = project_version_pattern.match(cleaned)
     if match:
         cleaned = match.group(1)
     
-    # 버전 3
     version_pattern = re.compile(r'^(\d+[a-zA-Z]?)[._-](\d+[a-zA-Z]?)(?:[._-](\d+[a-zA-Z]?))?(?:[._-].*)?$')
     return version_pattern.match(cleaned) is not None
 
@@ -824,14 +802,12 @@ def process_repo(eachUrl, component_type, requested_tags=None):
     os.chdir(currentPath)
     repoName = get_repo_name_from_url(eachUrl)
 
-    # Skip if already completed
     if is_repo_completed(repoName):
         print(f"[*] {repoName} is already completed")
         return
 
     print("[+] Processing", repoName)
 
-    # Define specific tags for each repository
     repo_tag_mapping = {
         'redis@@redis': ['4.0.0', '6.0.0', '7.2.0', '8.4.0'],
         'redis@@hiredis': ['v0.13.0', 'v1.0.0', 'v1.2.0'],
@@ -845,7 +821,6 @@ def process_repo(eachUrl, component_type, requested_tags=None):
 
     try:
         repo_dir = os.path.join(clonePath, repoName)
-        # Clone the repository (credential prompts disabled — fails fast on 404 / private repos)
         try:
             repo = _clone_repo(eachUrl, repo_dir)
         except git.exc.GitCommandError as clone_err:
@@ -869,7 +844,6 @@ def process_repo(eachUrl, component_type, requested_tags=None):
         funcCnt = 0
         lineCnt = 0
 
-        # Check if this repository has a specific tag mapping
         if requested_tags:
             target_tags = requested_tags
             write_tag_dates(repo, repoName, target_tags)
@@ -896,11 +870,9 @@ def process_repo(eachUrl, component_type, requested_tags=None):
                 print(f"Using specific tag {target_tag} for {repoName}")
 
                 try:
-                    # Checkout the specific tag
                     repo.git.checkout(f'tags/{target_tag}', force=True)
                     submodules = refresh_repo_sidecar_and_submodules(repo, repo_dir, repoName)
 
-                    # Collect and save metadata (version, purl, license id, type) for SBOM
                     collect_and_save_metadata(repo_dir, repoName, target_tag, component_type)
 
                     resDict, funcMeta, fileCnt, funcCnt, lineCnt = hashing(repo_dir, os.path.join(funcCodePath, repoName), repoName, target_tag, submodules)
@@ -943,7 +915,6 @@ def process_repo(eachUrl, component_type, requested_tags=None):
                     except Exception as e:
                         print(f"Error checking out tag {target_tag} for {repoName}: {e}")
             else:
-                # 필터링 결과 유효한 버전 태그가 없으면 HEAD 사용
                 print(f"No valid version tags found for {repoName}, using HEAD commit")
                 head_sha = repo.head.commit.hexsha
                 head_date = repo.git.log('HEAD', n=1, format="%ai")
@@ -965,7 +936,6 @@ def process_repo(eachUrl, component_type, requested_tags=None):
                     write_function_meta_sidecar(repoName, head_sha[:8], funcMeta)
 
         else:
-            # 태그가 아예 없는 경우: HEAD 커밋 사용
             head_sha = repo.head.commit.hexsha
             head_date = repo.git.log('HEAD', n=1, format="%ai")
             version = f"git+{head_sha}"
@@ -1011,7 +981,6 @@ def main():
             continue
         repo_entries.append(parsed)
 
-    # Use ThreadPoolExecutor to process repositories in parallel
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         futures = [
             executor.submit(process_repo, url, component_type, requested_tags)

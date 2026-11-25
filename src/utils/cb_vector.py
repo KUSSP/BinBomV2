@@ -4,7 +4,6 @@ from typing import List, Dict, Optional, Set, Tuple
 
 def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
     if len(vec1) != len(vec2):
-        # Pad shorter vector
         max_len = max(len(vec1), len(vec2))
         vec1 = vec1 + [0.0] * (max_len - len(vec1))
         vec2 = vec2 + [0.0] * (max_len - len(vec2))
@@ -29,7 +28,6 @@ def build_dynamic_vocab(src_dvector: dict, bin_dvector: dict) -> Tuple[Dict[str,
     vocab = {}
     idx = 0
 
-    # Collect all dynamic features from both sides
     src_numbers = set(src_dvector.get("numbers", []))
     bin_numbers = set(bin_dvector.get("numbers", []))
     all_numbers = src_numbers | bin_numbers
@@ -132,7 +130,6 @@ def combined_vector_similarity(
     bin_static_vec: str,
     bin_dvector: dict
 ) -> float:
-    # Convert static vectors
     src_static = bitvector_to_floats(src_static_vec)
     bin_static = bitvector_to_floats(bin_static_vec)
 
@@ -147,7 +144,6 @@ def combined_vector_similarity(
             return 0.0
         return cosine_similarity(src_static, bin_static)
 
-    # Get source function count as reference
     src_func_count = src_dvector.get("function_count", 0)
 
     # Convert dynamic parts to vectors (SBridge blockContentVectorize style)
@@ -170,11 +166,9 @@ def combined_vector_similarity(
             bin_dynamic, bin_numbers, src_numbers, bin_numtype_count, dyn_vocab
         )
 
-    # Combine: static + dynamic
     src_combined = src_static + src_dynamic
     bin_combined = bin_static + bin_dynamic
 
-    # Handle empty cases
     if not src_combined and not bin_combined:
         return 1.0
     if not src_combined or not bin_combined:

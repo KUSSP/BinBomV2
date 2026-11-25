@@ -102,12 +102,10 @@ def get_ascii_value(char_value: str) -> int:
 
 
 def process_literal_value(value: str) -> Tuple[str, Optional[int]]:
-    # 단일 문자 리터럴 'a'
     if len(value) == 3 and value.startswith("'") and value.endswith("'"):
         char_value = value[1:2]
         return ("ASCII", get_ascii_value(char_value))
 
-    # 이스케이프 문자 리터럴 '\n'
     elif len(value) == 4 and value.startswith("'\\") and value.endswith("'"):
         escape_seq = value[1:3]
         return ("ASCII", get_ascii_value(escape_seq))
@@ -209,7 +207,6 @@ def preprocess_key_feature(key_feature: List[str]) -> List[BCVElement]:
         elif element_type == "OPERATOR":
             operator_class = classify_operator(value)
 
-            # 특수 연산자 처리
             if value in ("preIncrement", "postIncrement"):
                 elements.append(BCVElement(BCVType.OPERATOR, "addOpr"))
                 elements.append(BCVElement(BCVType.NUM, 1))
@@ -275,7 +272,6 @@ def preprocess_key_feature(key_feature: List[str]) -> List[BCVElement]:
         else:
             i += 1
 
-    # function count 추가
     if function_names:
         elements.insert(0, BCVElement(BCVType.FUNCTION_COUNT, len(function_names)))
 
@@ -395,7 +391,7 @@ def vectorize(elements: List[BCVElement], vocabulary: Vocabulary, src_function_c
             numbers.append(elem.value)
             if elem.value in vocabulary.number_to_index:
                 idx = vocabulary.number_to_index[elem.value]
-                vector[idx] = 1.0  # Binary vector: 0 or 1 only
+                vector[idx] = 1.0
 
         elif elem.type == BCVType.NUM_TYPE:
             num_type_positions.append(position)
@@ -404,28 +400,28 @@ def vectorize(elements: List[BCVElement], vocabulary: Vocabulary, src_function_c
             # LVAR, PVAR
             if elem.value in vocabulary.element_type_to_index:
                 idx = vocabulary.element_type_to_index[elem.value]
-                vector[idx] = 1.0  # Binary vector: 0 or 1 only
+                vector[idx] = 1.0
             # LibC functions
             elif elem.value in vocabulary.libc_func_to_index:
                 idx = vocabulary.libc_func_to_index[elem.value]
-                vector[idx] = 1.0  # Binary vector: 0 or 1 only
+                vector[idx] = 1.0
 
         elif elem.type == BCVType.OPERATOR:
             if elem.value in vocabulary.operator_to_index:
                 idx = vocabulary.operator_to_index[elem.value]
-                vector[idx] = 1.0  # Binary vector: 0 or 1 only
+                vector[idx] = 1.0
 
         elif elem.type == BCVType.LITERAL_VALUE:
             literal_values.append(elem.value)
             if elem.value in vocabulary.literal_value_to_index:
                 idx = vocabulary.literal_value_to_index[elem.value]
-                vector[idx] = 1.0  # Binary vector: 0 or 1 only
+                vector[idx] = 1.0
 
         elif elem.type == BCVType.FUNCTION_VALUE:
             function_values.append(elem.value)
             if elem.value in vocabulary.function_value_to_index:
                 idx = vocabulary.function_value_to_index[elem.value]
-                vector[idx] = 1.0  # Binary vector: 0 or 1 only
+                vector[idx] = 1.0
 
         elif elem.type == BCVType.FUNCTION_COUNT:
             function_count = elem.value
@@ -445,31 +441,16 @@ def vectorize(elements: List[BCVElement], vocabulary: Vocabulary, src_function_c
 
 
 def vectorize_key_feature(key_feature: List[str], vocabulary: Optional[Vocabulary] = None, src_function_count: int = 0) -> Tuple[BlockContentVector, Vocabulary]:
-    """
-    key_feature를 벡터화
-
-    Args:
-        key_feature: key_feature 리스트 (예: ["(OPERATOR,equals)", "(IDENTIFIER,LVAR)", "(NUM,0)"])
-        vocabulary: 기존 어휘 (없으면 새로 생성)
-        src_function_count: 소스 함수 카운트
-
-    Returns:
-        (벡터화 결과, 어휘)
-    """
-    # 1. 전처리
+    """key_feature를 벡터화. vocabulary가 없으면 새로 만든다."""
     elements = preprocess_key_feature(key_feature)
 
-    # 2. 숫자 계산
     elements = calculate_numbers(elements)
 
-    # 3. 논리→비교 변환
     elements = convert_logical_to_comparison(elements)
 
-    # 4. 어휘 구축 (새로운 어휘가 필요한 경우)
     if vocabulary is None:
         vocabulary = build_vocabulary([elements])
 
-    # 5. 벡터화
     vector_result = vectorize(elements, vocabulary, src_function_count)
 
     return vector_result, vocabulary

@@ -70,6 +70,26 @@ build_repo() {
     case "$repo" in
         'IlyaGrebnov@@libbsc'|'MarcinZukowski@@pivco-huffman'|'ebiggers@@libdeflate'|'evpobr@@sndfile2k'|'flanglet@@kanzi-cpp'|'google@@brunsli'|'google@@zopfli'|'hellobertrand@@zxc'|'libsndfile@@libsndfile'|'lzfse@@lzfse'|'madler@@zlib'|'nemequ@@lzo'|'richgel999@@lzham_codec_devel'|'richgel999@@miniz'|'robottwo@@quicklz'|'tukaani-project@@xz'|'welcome-to-the-sunny-side@@misa77'|'zlib-ng@@zlib-ng')
             cmake_build "$repo" "$d" "${repo//@@/__}" ;;
+        'HdrHistogram@@HdrHistogram_c')
+            # the log component needs zlib; the core histogram does not
+            cmake_build "$repo" "$d" "${repo//@@/__}" -DHDR_LOG_REQUIRED=OFF || true ;;
+        'redis@@hiredis')
+            make_build "$repo" "$d" OPTIMIZATION=-O0 DEBUG_FLAGS=-g dynamic || true ;;
+        'jemalloc@@jemalloc')
+            # configure always adds -O3; EXTRA_CFLAGS comes last and overrides it.
+            if [ ! -x "$d/configure" ]; then
+                run_logged "$repo" autogen bash -c "cd '$d' && ./autogen.sh" || true
+            fi
+            make_build "$repo" "$d" EXTRA_CFLAGS='-O0 -g' build_lib_shared || true ;;
+        'lua@@lua')
+            # Lua's own repository has no src/ tree; ltests.c and lua.c are not part of the library.
+            run_logged "$repo" manual-shared bash -c "cd '$d' && gcc -O0 -g -fPIC -shared -DLUA_USE_LINUX \$(ls l*.c | grep -vxE 'lua.c|luac.c|ltests.c') -lm -ldl -o '$WORK/manual/lua__lua/liblua.so'" || true ;;
+        'antirez@@linenoise')
+            run_logged "$repo" manual-shared gcc -O0 -g -fPIC -shared "$d/linenoise.c" \
+                -o "$WORK/manual/antirez__linenoise/liblinenoise.so" || true ;;
+        'night-shift@@fpconv')
+            run_logged "$repo" manual-shared gcc -O0 -g -fPIC -shared "$d/src/fpconv.c" -I"$d/src" \
+                -o "$WORK/manual/night-shift__fpconv/libfpconv.so" || true ;;
         'deus-libri@@preflate')
             cmake_build "$repo" "$d" "${repo//@@/__}" \
                 -DCMAKE_CXX_FLAGS='-O0 -g -include stdint.h -D_ftelli64=ftello64 -D_fseeki64=fseeko64' ;;
@@ -203,37 +223,72 @@ build_repo() {
     esac
 }
 
+# Directory names that hold other components: the vendor directories the
+# source DB skips (src/OSScollector.py VENDORED_DIR_NAMES), plus the trees
+# CMake ExternalProject/FetchContent download and build dependencies in.
+VENDORED_DIRS="third_party thirdparty 3rdparty third-party vendor vendored external externals external_libs components deps dependencies contrib extern submodule submodules subprojects buildtrees _deps"
+
+# is_vendored_path </path/relative/to/a/collection/root>
+is_vendored_path() {
+    local part
+    local IFS=/
+    for part in $1; do
+        case " $VENDORED_DIRS " in
+            *" $part "*) return 0 ;;
+        esac
+        case "$part" in
+            *-prefix) return 0 ;;
+        esac
+    done
+    return 1
+}
+
 collect_repo() {
     local repo=$1
     local d
     d=$(repo_dir "$repo")
     local safe=${repo//@@/__}
     local roots=("$d" "$WORK/cmake/$safe" "$WORK/manual/$safe")
-    while IFS= read -r -d '' f; do
-        case "$f" in
-            */.git/*|*/CMakeFiles/*) continue ;;
-        esac
-        local info
-        info=$(file -b "$f")
-        case "$info" in
-            ELF*executable*|ELF*"shared object"*) ;;
-            *) continue ;;
-        esac
-        local base dest rel digest n=0
-        base=$(basename "$f")
-        dest="$OUT/${safe}__${base}"
-        while [ -e "$dest" ]; do
-            digest=$(sha256sum "$f" | cut -c1-12)
-            dest="$OUT/${safe}__${base}__${digest}"
-            n=$((n + 1))
-            [ "$n" -gt 2 ] && break
-        done
-        [ -e "$dest" ] && continue
-        cp -p "$f" "$dest"
-        chmod a+rX "$dest"
-        printf '%s\tbinary\t%s\t%s\t%s\n' "$repo" "$f" "${dest##*/}" "$info" >> "$MANIFEST"
-        printf '  collected %s -> %s\n' "$info" "${dest##*/}"
-    done < <(find "${roots[@]}" -type f -perm /111 -print0 2>/dev/null)
+    local version
+    version=$(git -C "$d" describe --tags --exact-match 2>/dev/null || git -C "$d" rev-parse HEAD 2>/dev/null || echo unknown)
+    local root rel
+    for root in "${roots[@]}"; do
+        [ -d "$root" ] || continue
+        while IFS= read -r -d '' f; do
+            case "$f" in
+                */.git/*|*/CMakeFiles/*) continue ;;
+            esac
+            # Dependencies the repository vendors or fetches while building are
+            # other components; labelling their binaries with this repository
+            # would make the binary DB report it wherever those libraries appear.
+            rel="/${f#"$root"/}"
+            if is_vendored_path "${rel%/*}"; then
+                continue
+            fi
+            local info
+            info=$(file -b "$f")
+            case "$info" in
+                ELF*executable*|ELF*"shared object"*) ;;
+                *) continue ;;
+            esac
+            local base dest digest n=0
+            base=$(basename "$f")
+            dest="$OUT/${safe}__${base}"
+            while [ -e "$dest" ]; do
+                digest=$(sha256sum "$f" | cut -c1-12)
+                dest="$OUT/${safe}__${base}__${digest}"
+                n=$((n + 1))
+                [ "$n" -gt 2 ] && break
+            done
+            [ -e "$dest" ] && continue
+            cp -p "$f" "$dest"
+            chmod a+rX "$dest"
+            # binaryDB_build.py identifies the component from this file, not the name.
+            printf '{"component": "%s", "version": "%s"}\n' "$repo" "$version" > "$dest.meta.json"
+            printf '%s\tbinary\t%s\t%s\t%s\n' "$repo" "$f" "${dest##*/}" "$info" >> "$MANIFEST"
+            printf '  collected %s -> %s\n' "$info" "${dest##*/}"
+        done < <(find "$root" -type f -perm /111 -print0 2>/dev/null)
+    done
 }
 
 mapfile -t REPOS < <(find "$SRC" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
@@ -246,8 +301,8 @@ for repo in "${REPOS[@]}"; do
 done
 
 printf '%s\n' '--- ELF collection summary ---'
-find "$OUT" -maxdepth 1 -type f ! -name .build_manifest.tsv -print0 |
+find "$OUT" -maxdepth 1 -type f ! -name .build_manifest.tsv ! -name '*.meta.json' -print0 |
     xargs -0 -r file | sort
 printf 'Collected ELF files: '
-find "$OUT" -maxdepth 1 -type f ! -name .build_manifest.tsv | wc -l
+find "$OUT" -maxdepth 1 -type f ! -name .build_manifest.tsv ! -name '*.meta.json' | wc -l
 printf 'Build manifest: %s\n' "$MANIFEST"

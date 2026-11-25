@@ -69,6 +69,32 @@ VENDORED_DIR_NAMES = {
 	"extern",
 }
 
+# Code a repository ships next to its library but does not build into it:
+# tests, examples, benchmarks, fuzzers and add-ons.
+# Kept out of the component's own functions so that binaries linking only the
+# library are not expected to contain their callers or strings.
+NON_LIBRARY_DIR_NAMES = {
+	"test",
+	"tests",
+	"testing",
+	"unittest",
+	"unittests",
+	"example",
+	"examples",
+	"sample",
+	"samples",
+	"demo",
+	"demos",
+	"bench",
+	"benchmark",
+	"benchmarks",
+	"fuzz",
+	"fuzzing",
+	"doc",
+	"docs",
+	"contrib",
+}
+
 UNSUPPORTED_SOURCE_SYMBOLS = {
 	"",
 	"_start",
@@ -332,13 +358,8 @@ HUB_NEIGHBOR_THRESHOLD = 8
 
 
 def _hub_components(dependency_children):
-	"""Components that vendor/share code with many others (benchmark harnesses like
-	lzbench/TurboBench/precomp-cpp) rather than being a single distinct origin.
-
-	dependency_children edges are recorded per-file and end up roughly symmetric for
-	these aggregator repos, so a plain undirected neighbor count identifies them
-	without needing to hardcode names.
-	"""
+	"""Components that vendor code from many others, found by undirected
+	dependency_children neighbor count."""
 	neighbors = defaultdict(set)
 	for parent, children in dependency_children.items():
 		for child in children:
@@ -348,15 +369,8 @@ def _hub_components(dependency_children):
 
 
 def _unique_owner_map(owners_by_key, hubs):
-	"""key -> single owner, tolerant of hub-vendored duplicates.
-
-	A hub only ever copies code from elsewhere, so its presence in another
-	component's owner set is not a real collision (Tier 1-3 provenance already
-	knows the true origin, but that resolution never reaches the raw per-file
-	strings/symbols feature extraction — this recovers it at index-build time).
-	A hub itself only earns "unique" credit for keys nobody else holds at all
-	(its own harness/glue code), never for code it merely vendors.
-	"""
+	"""key -> single owner. A hub sharing a key with one non-hub does not
+	count as a collision; the hub owns only keys nobody else holds."""
 	unique = {}
 	for key, owners in owners_by_key.items():
 		if len(owners) == 1:
@@ -420,7 +434,7 @@ def process_func_file_to_controlblock(func_file_path, output_json_path, timeout_
 	try:
 		old_handler = signal.signal(signal.SIGALRM, timeout_handler)
 		signal.alarm(timeout_seconds)
-		language = "cpp" if str(func_file_path).endswith((".cpp", ".cc")) else "c"
+		language = "cpp" if str(func_file_path).endswith((".cpp", ".cc", ".cxx", ".c++")) else "c"
 		analyzer = CBMaker(language=language)
 		sys.stdout = io.StringIO()
 		sys.stderr = io.StringIO()
@@ -444,7 +458,7 @@ def process_func_file_to_controlblock(func_file_path, output_json_path, timeout_
 
 
 def source_language_for_file(file_path):
-	return "cpp" if str(file_path).endswith((".cpp", ".cc", ".cxx")) else "c"
+	return "cpp" if str(file_path).endswith((".cpp", ".cc", ".cxx", ".c++")) else "c"
 
 
 def sanitize_version_name(version_name):
@@ -535,14 +549,24 @@ def load_source_occurrences():
 
 
 def is_vendored_path(src_path):
-	"""True if any path segment is a canonical vendor directory name.
-
-	Conservative whitelist only — generic names like `lib`, `libs`,
-	`components` are intentionally excluded. Anything not on the whitelist
-	falls through to the file-level TLSH check downstream.
-	"""
+	"""True if any path segment is a canonical vendor directory name."""
 	parts = [part.lower().replace("-", "_") for part in str(src_path).replace("\\", "/").split("/") if part]
 	return any(part in VENDORED_DIR_NAMES for part in parts)
+
+
+def is_non_library_path(src_path):
+	"""True if any directory segment is a test/example/contrib-style name."""
+	parts = [part.lower().replace("-", "_") for part in str(src_path).replace("\\", "/").split("/") if part]
+	return any(part in NON_LIBRARY_DIR_NAMES for part in parts[:-1])
+
+
+def skipped_non_library(file_path):
+	return {
+		"origin_component": None,
+		"role": "skipped",
+		"origin_decision": "non_library_path",
+		"evidence": [f"observed_path:{file_path}"],
+	}
 
 
 def path_dirname(src_path):
@@ -562,34 +586,15 @@ def choose_origin_for_file(
 	earliest_birth_by_component,
 	known_components,
 ):
-	"""Decide a single origin for *all* functions in (repo_name, file_path).
+	"""Decide one origin for all functions in (repo_name, file_path).
 
-	A file is the structural unit of vendoring: either every function in it
-	is the OSS's own code, or every function was copied wholesale from
-	another component. Per-function decisions led to unstable mixed-role
-	files and to widespread misclassification when generic helper functions
-	coincidentally matched another component's TLSH.
-
-	Tier 1 — explicit git submodule.
-	         If the submodule points to a component that exists in the DB
-	         → vendored to it. If the submodule's target is unknown to the
-	         DB the file is still treated as foreign — Tier 3 may re-home
-	         it onto a known component, otherwise it is dropped entirely
-	         (not attributed back to the parent repo) so unknown bundled
-	         code never inflates the parent's own surface.
-	Tier 2 — path under a canonical vendor directory whitelist
-	         (third_party, vendor, external, deps, contrib, dependencies,
-	         extern). Origin is any TLSH-holder; ties broken by earliest
-	         birth_date. Lib/libs/components are intentionally excluded —
-	         they are too generic to act as a hard signal and instead fall
-	         through to Tier 3 which requires structural TLSH evidence.
-	Tier 3 — every TLSH in this file is also present in another component.
-	         Origin is the holder with the earliest birth_date for this
-	         file's TLSHes. This is what catches src/lib/{fmt,plog,...}
-	         style vendoring as well as fork-style cross-attribution
-	         (e.g. terarkdb → rocksdb).
-	Tier 4 — own (only when none of the above triggered AND the file is not
-	         a submodule pointing to an unknown component).
+	Tier 1: git submodule of a known component.
+	Tier 2: path under a vendor directory; origin is the earliest TLSH holder.
+	Tier 3: every TLSH of the file is held by another component; origin is the
+	        earliest common holder.
+	Tier 4: own code.
+	A holder is a component that has the TLSH as its own code. Files vendored
+	from an unknown component and non-library files are dropped.
 	"""
 	# Tier 1: declared git submodule
 	submodule = any_occurrence.get("submodule_component")
@@ -607,10 +612,6 @@ def choose_origin_for_file(
 					{f"submodule_commit:{any_occurrence.get('submodule_commit')}"} if any_occurrence.get("submodule_commit") else set()
 				)),
 			}
-		# Submodule target not present in DB. Fall through to Tier 2/3 so
-		# a different known component may still claim the file via TLSH.
-		# If nothing claims it, the Tier 4 fallback below drops the file
-		# instead of attributing it to the parent repo.
 		submodule_to_unknown = True
 
 	# Tier 2: canonical vendor directory
@@ -630,7 +631,12 @@ def choose_origin_for_file(
 					f"tlsh_match_count:{sum(1 for t in file_tlshes if origin in tlshes_by_component.get(t, set()))}",
 				}),
 			}
-		# Vendor folder but no TLSH evidence → fall through to own.
+		return {
+			"origin_component": None,
+			"role": "skipped",
+			"origin_decision": "vendored_to_unknown_component",
+			"evidence": [f"vendor_dir_path:{file_path}"],
+		}
 
 	# Tier 3: every TLSH in this file appears in another component
 	if file_tlshes:
@@ -656,8 +662,6 @@ def choose_origin_for_file(
 				}),
 			}
 
-	# Submodule target unknown to DB and no Tier 2/3 home found → drop the
-	# file entirely so its functions don't pollute the parent's own surface.
 	if submodule_to_unknown:
 		return {
 			"origin_component": None,
@@ -669,6 +673,9 @@ def choose_origin_for_file(
 				f"observed_path:{file_path}",
 			}),
 		}
+
+	if is_non_library_path(file_path):
+		return skipped_non_library(file_path)
 
 	# Tier 4: own
 	return {
@@ -697,7 +704,7 @@ def _pick_earliest_holder(holders, file_tlshes, earliest_birth_by_component):
 
 def source_file_for_hash(repo_name, func_hash):
 	repo_dir = Path(funcCodePath) / repo_name
-	for ext in (".c", ".cpp", ".cc"):
+	for ext in (".c", ".cpp", ".cc", ".cxx", ".c++"):
 		candidate = repo_dir / f"{func_hash}{ext}"
 		if candidate.exists():
 			return candidate
@@ -747,10 +754,11 @@ def extract_feature_payload(blocks, occurrences):
 	for block in blocks:
 		if not isinstance(block, dict):
 			continue
-		if block.get("block_type") == "String":
-			for value in block.get("key_feature_dvector", {}).get("literal_values", []):
-				if not path_basename_hint(value) and is_discriminative_string(value):
-					strings.add(value)
+		# A string the function uses is its string wherever it appears:
+		# an argument, an assignment or an if/while condition.
+		for value in (block.get("key_feature_dvector") or {}).get("literal_values", []):
+			if not path_basename_hint(value) and is_discriminative_string(value):
+				strings.add(value)
 		if block.get("block_type") == "CalleeFunc":
 			for value in block.get("key_feature_dvector", {}).get("function_values", []):
 				callee = normalize_callee_name(value)
@@ -793,7 +801,12 @@ def get_or_create_function_feature(func_hash, occurrences, preferred_repo):
 	if feature_file.exists():
 		existing = read_json_file(feature_file, {})
 		if isinstance(existing, dict) and "features" in existing:
-			payload = existing.get("features", {})
+			# Only the control blocks are expensive; derive the rest anew so a
+			# change to how strings or symbols are read takes effect.
+			payload = extract_feature_payload(existing["features"].get("control_blocks", []), occurrences)
+			if payload != existing["features"]:
+				existing["features"] = payload
+				atomic_write_json(feature_file, existing)
 			return features_ref, feature_summary(payload), payload, existing.get("language") or language
 		if isinstance(existing, list):
 			payload = extract_feature_payload(existing, occurrences)
@@ -885,24 +898,11 @@ def edge_children_by_component(dependency_edges):
 
 
 def refine_shared_copies(all_comp_data, dependency_children):
-	"""2nd-pass: re-classify component_own_source functions whose callee set is
-	identical (and non-empty) to a function of the same name in another component.
-
-	Uses path_birth_date to determine the true owner:
-	- Earlier birth date → owner → keep in symbol_index
-	- Later birth date   → copy  → remove from symbol_index
-	- Same or unknown    → ambiguous → remove from both
-
-	Exception: a known vendoring hub (a benchmark harness like lzbench/
-	TurboBench/precomp-cpp that bundles dozens of other libraries' source
-	verbatim) never wins this comparison and never drags its non-hub
-	counterpart down via the "ambiguous → remove both" fallback — its
-	birth date reflects when it happened to vendor the code, not when the
-	code was authored, so only the hub's own copy is ever removed.
-	"""
+	"""Remove copies of a same-named function with an identical non-empty callee
+	set from symbol_index. The earlier path_birth_date keeps it, ties remove
+	both, and a hub always loses to a non-hub."""
 	hubs = _hub_components(dependency_children)
 
-	# func_name → {comp: (frozenset(callees), path_birth_date)}
 	func_info: dict = defaultdict(dict)
 	for comp, data in all_comp_data.items():
 		for item in data["callee_items"]:
@@ -913,9 +913,7 @@ def refine_shared_copies(all_comp_data, dependency_children):
 					item.get("path_birth_date"),
 				)
 
-	# For each (fn, comp_pair) with identical non-empty callees:
-	# keep owner (earlier birth), remove copy (later birth), or remove both if ambiguous
-	shared_funcs: dict = defaultdict(set)  # comp → set of function names to remove
+	shared_funcs: dict = defaultdict(set)
 	for fn, comp_map in func_info.items():
 		if len(comp_map) < 2:
 			continue
@@ -935,19 +933,15 @@ def refine_shared_copies(all_comp_data, dependency_children):
 				if hub2 and not hub1:
 					shared_funcs[c2].add(fn)
 					continue
-				# same function — determine owner by birth date
 				if bd1 and bd2 and bd1 != bd2:
-					# earlier = owner → remove the later one only
 					if bd1 < bd2:
 						shared_funcs[c2].add(fn)
 					else:
 						shared_funcs[c1].add(fn)
 				else:
-					# ambiguous (same date or missing) → remove both
 					shared_funcs[c1].add(fn)
 					shared_funcs[c2].add(fn)
 
-	# Remove copy symbols from symbol_index
 	total_removed = 0
 	for comp, names in shared_funcs.items():
 		sym_idx = all_comp_data[comp]["symbol_index"]
@@ -966,7 +960,7 @@ def materialize_component_feature_db(component_functions, dependency_edges):
 	rare_function_df = defaultdict(int)
 	rare_postings = defaultdict(list)
 
-	# ── Pass 1: collect all per-component data in memory ──────────────────────
+	# Pass 1: collect per-component data
 	all_comp_data = {}
 
 	for component, functions_by_hash in sorted(component_functions.items()):
@@ -1051,17 +1045,17 @@ def materialize_component_feature_db(component_functions, dependency_edges):
 		all_comp_data[component] = {
 			"control_block_items": control_block_items,
 			"string_index":        string_index,
-			"symbol_index":        symbol_index,   # mutable — refined in pass 2
+			"symbol_index":        symbol_index,
 			"callee_items":        callee_items,
 			"callstr_index":       callstr_index,
 			"call_edges":          call_edges,
 			"functions_by_hash":   functions_by_hash,
 		}
 
-	# ── Pass 2: callee-based shared-copy refinement ───────────────────────────
+	# Pass 2: callee-based shared-copy refinement
 	refine_shared_copies(all_comp_data, dependency_children)
 
-	# ── Pass 3: write all output files ────────────────────────────────────────
+	# Pass 3: write output files
 	component_summaries = {}
 	startup_symbol_owners = defaultdict(set)
 	startup_string_owners = defaultdict(set)
@@ -1069,7 +1063,7 @@ def materialize_component_feature_db(component_functions, dependency_edges):
 
 	for component, data in sorted(all_comp_data.items()):
 		string_index  = data["string_index"]
-		symbol_index  = data["symbol_index"]   # already refined
+		symbol_index  = data["symbol_index"]
 		callstr_index = data["callstr_index"]
 
 		string_items  = indexed_feature_items(string_index, "string", "discriminative_string")
@@ -1147,33 +1141,30 @@ def write_source_provenance_db():
 		print("[!] No source occurrences found under osscollector/repo_functions")
 		return
 
-	# Cross-component indexes used by the file-level decision:
-	#   tlshes_by_component[component] -> set of TLSHes the component holds
-	#   tlshes_to_components[tlsh]     -> set of components containing it
-	#   earliest_birth_by_component[component][tlsh] -> earliest path_birth_date
 	tlshes_by_component: dict = defaultdict(set)
 	tlshes_to_components: dict = defaultdict(set)
+	own_tlshes_to_components: dict = defaultdict(set)
 	earliest_birth_by_component: dict = defaultdict(dict)
 	for occurrence in occurrences:
 		repo = occurrence["repo"]
 		tlsh = occurrence["tlsh"]
 		tlshes_by_component[repo].add(tlsh)
 		tlshes_to_components[tlsh].add(repo)
+		if (not occurrence.get("submodule_component") and not is_vendored_path(occurrence["path"])
+				and not is_non_library_path(occurrence["path"])):
+			own_tlshes_to_components[tlsh].add(repo)
 		bd = occurrence.get("path_birth_date")
 		if bd:
 			prev = earliest_birth_by_component[repo].get(tlsh)
 			if prev is None or bd < prev:
 				earliest_birth_by_component[repo][tlsh] = bd
 
-	# Group occurrences by (repo, path) — the file is the decision unit.
+
 	occurrences_by_file: dict = defaultdict(list)
 	for occurrence in occurrences:
 		occurrences_by_file[(occurrence["repo"], occurrence["path"])].append(occurrence)
 
-	# Set of components present in our DB (i.e. we have scanned their source).
-	# Used to gate the explicit-submodule branch in choose_origin_for_file —
-	# submodules whose target is not in this set are never attributed to the
-	# parent repo as own code.
+
 	known_components = set(tlshes_by_component.keys())
 
 	function_origin = []
@@ -1195,7 +1186,7 @@ def write_source_provenance_db():
 			file_path,
 			file_tlshes,
 			any_occurrence,
-			tlshes_to_components,
+			own_tlshes_to_components,
 			earliest_birth_by_component,
 			known_components,
 		)
@@ -1283,11 +1274,10 @@ def write_source_provenance_db():
 	print(f"[+] Rare control-token index written: {rareControlIndexPath}")
 
 
-# --- namespace unique-token index (inlined from former extract_namespaces.py) ---
 NS_SRC_DIR = os.path.join(osscollectorPath, "repo_src")
 NS_OUT_DIR = os.path.join(finalDBPath, "namespaces")
 NS_OWNER_INDEX_PATH = os.path.join(finalDBPath, "namespace_owner_index.json")
-NS_SOURCE_EXTS = {".h", ".hpp", ".hh", ".c", ".cc", ".cpp", ".cxx"}
+NS_SOURCE_EXTS = {".h", ".hpp", ".hh", ".c", ".cc", ".cpp", ".cxx", ".c++"}
 NS_VENDORED_DIR_NAMES = {
 	"third_party", "thirdparty", "3rdparty", "third-party",
 	"vendor", "vendored", "external", "externals", "external_libs",
@@ -1299,7 +1289,6 @@ NS_EXCLUDED_DIR_NAMES = {
 	"build", "cmake-build-debug", "cmake-build-release",
 	"test", "tests", "testing", "doc", "docs", "example", "examples", "sample", "samples",
 }
-# match "namespace X {" or "namespace X::Y::Z {" — capture the full path
 NS_RE = re.compile(
 	r"\bnamespace\s+([A-Za-z_][A-Za-z_0-9]*(?:\s*::\s*[A-Za-z_][A-Za-z_0-9]*)*)\s*\{"
 )
@@ -1321,7 +1310,6 @@ NS_GENERIC = {
 	"view", "write", "xml", "zip",
 }
 
-# --- CB-block ANN index (inlined from former index_cb_blocks.py) ---
 CB_INTERNAL_BLOCK_TYPES = {"Condition", "Loop", "Else"}
 
 
@@ -1336,7 +1324,7 @@ def ns_iter_source_files(repo_root, foreign_short_names):
 			dl = d.lower()
 			if dl in NS_EXCLUDED_DIR_NAMES or dl in NS_VENDORED_DIR_NAMES:
 				continue
-			# Skip nested dirs named after a different OSS — vendored copies.
+			# Skip nested dirs named after another OSS (vendored copies).
 			if dl != own_short_name and dl in foreign_short_names:
 				continue
 			keep.append(d)
@@ -1365,7 +1353,7 @@ def ns_extract_for_repo(repo_root, foreign_short_names):
 
 
 def build_namespace_index():
-	"""Provenance-anchor namespace unique-token index (formerly extract_namespaces.py)."""
+	"""Namespace tokens unique to one component."""
 	print("[+] Extracting namespace tokens...")
 	if not os.path.isdir(NS_SRC_DIR):
 		print(f"[!] Source dir not found: {NS_SRC_DIR}", file=sys.stderr)
@@ -1448,10 +1436,6 @@ def load_cb_records(path, comp_name, cbi):
 
 
 def build_cb_block_index():
-	"""Build the CB-block FAISS index (formerly index_cb_blocks.py).
-
-	The componentDB was just (re)built, so this always rebuilds the index.
-	"""
 	print("[+] Building CB-block ANN index...")
 	import cb_index as cbi  # lazy: keeps faiss optional for the rest of the pipeline
 
@@ -1478,11 +1462,8 @@ def build_cb_block_index():
 
 
 def main():
-	# 1) provenance decision + CB/feature extraction into componentDB
 	write_source_provenance_db()
-	# 2) namespace unique-token index (provenance anchor)
 	build_namespace_index()
-	# 3) CB-block ANN index over the freshly built componentDB
 	build_cb_block_index()
 
 

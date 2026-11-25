@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 CB_VECTOR_DIM = 368    # 364-bit key_feature_vector padded to next multiple of 8
-CB_DIM_BYTES = CB_VECTOR_DIM // 8  # 46
+CB_DIM_BYTES = CB_VECTOR_DIM // 8
 CB_MAX_HAMMING = 80
 
 INDEX_FILENAME = "cb_blocks.index"

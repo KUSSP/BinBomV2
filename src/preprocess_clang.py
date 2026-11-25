@@ -5,7 +5,7 @@ import subprocess
 
 def generate_clang_command(file_path, root_path):
 
-    if file_path.endswith((".cpp", ".cc", ".hpp", ".hxx")):
+    if file_path.endswith((".cpp", ".cc", ".cxx", ".c++", ".hpp", ".hxx")):
         lang = "c++"
     else:
         lang = "c"
@@ -24,7 +24,7 @@ def generate_clang_command(file_path, root_path):
 
 
 def process_files_in_directory(root_path):
-    possible_exts = (".c", ".cc", ".cpp", ".hpp", ".hxx", ".h")
+    possible_exts = (".c", ".cc", ".cpp", ".cxx", ".c++", ".hpp", ".hxx", ".h")
     for dirpath, _, filenames in os.walk(root_path):
         for filename in filenames:
             if not filename.endswith(possible_exts):
@@ -33,7 +33,6 @@ def process_files_in_directory(root_path):
             output_file = file_path + '.i'
 
             if os.path.exists(output_file):
-                # Already preprocessed
                 continue
 
             clang_command = generate_clang_command(file_path, root_path)
@@ -45,8 +44,6 @@ def process_files_in_directory(root_path):
                     text=True,
                 )
                 if completed.returncode != 0:
-                    # Preprocessing failed for this file; skip silently
                     continue
             except Exception:
-                # Unexpected error; skip this file
                 continue
